@@ -4,12 +4,15 @@ from __future__ import annotations
 
 import html
 import re
+import threading
 from dataclasses import dataclass
 from urllib.parse import urldefrag
 
 import lightpanda
 
 from review_helper.pr_urls import PullRequestRef
+
+_FETCH_SEM = threading.Semaphore(8)
 
 LOGIN_HINTS = (
     "sign in to github",
@@ -38,17 +41,14 @@ MERGED_MARKERS = {
         "was merged",
         "successfully merged and closed",
         "pull request successfully merged",
-        " merged ",
+        "merged into",
         "** merged **",
-        "state merged",
     ),
     "gitlab": (
         "merged by",
         "was merged",
-        "state merged",
-        "status: merged",
-        "status merged",
         "merge request was merged",
+        "status: merged",
     ),
 }
 
@@ -59,11 +59,19 @@ NOT_MERGED_MARKERS = (
     "awaiting merge",
     "not merged",
     "open merge request",
+    "open pull request",
 )
 
-FETCH_WAIT_MS = 8000
-FETCH_RETRY_WAIT_MS = 12000
-MIN_COMPLETE_TEXT_LEN = 25_000
+FETCH_WAIT_MS = 5000
+FETCH_RETRY_WAIT_MS = 10000
+FETCH_RECHECK_WAIT_MS = 15000
+
+OPEN_MARKERS = (
+    "open pull request",
+    "open merge request",
+    "ready for review",
+    "convert to draft",
+)
 
 
 @dataclass(frozen=True, slots=True)
@@ -104,20 +112,9 @@ def _is_merged_title(title: str, platform: str) -> bool:
 
 def _is_merged_text(text: str, platform: str) -> bool:
     lower = text.lower()
-    markers = MERGED_MARKERS.get(platform, ())
-    if not any(marker in lower for marker in markers):
-        return False
     if any(marker in lower for marker in NOT_MERGED_MARKERS):
-        strong = (
-            " merged this pull request",
-            "was merged",
-            "successfully merged",
-            "merged by",
-            "merge request was merged",
-            "** merged **",
-        )
-        return any(marker in lower for marker in strong)
-    return True
+        return False
+    return any(marker in lower for marker in MERGED_MARKERS.get(platform, ()))
 
 
 def _looks_like_login_page(text: str) -> bool:
@@ -142,24 +139,17 @@ def _text_from_html(page_html: str) -> str:
     return re.sub(r"\s+", " ", text)
 
 
-def _fetch_page_text(url: str, *, wait_ms: int = FETCH_WAIT_MS) -> str:
-    best = ""
-    waits = [wait_ms]
-    if wait_ms < FETCH_RETRY_WAIT_MS:
-        waits.append(FETCH_RETRY_WAIT_MS)
-
-    for current_wait in waits:
+def _fetch_page_text(url: str, *, wait_ms: int) -> str:
+    with _FETCH_SEM:
         for dump in ("markdown", "html"):
             try:
-                response = lightpanda.fetch(url, dump=dump, wait_ms=current_wait)
+                response = lightpanda.fetch(url, dump=dump, wait_ms=wait_ms)
                 text = response.text if dump == "markdown" else _text_from_html(response.text)
+                if len(text) > 500:
+                    return text
             except Exception:
                 continue
-            if len(text) > len(best):
-                best = text
-            if len(text) >= MIN_COMPLETE_TEXT_LEN:
-                return text
-    return best
+    return ""
 
 
 def _urls_to_check(tabs: list[PullRequestRef]) -> list[str]:
@@ -184,15 +174,32 @@ def _urls_to_check(tabs: list[PullRequestRef]) -> list[str]:
     return [url for _, url in scored]
 
 
+def _page_looks_complete(text: str, platform: str) -> bool:
+    lower = text.lower()
+    if len(text) >= 8000:
+        return True
+    if platform == "github" and "pull request" in lower:
+        return True
+    if platform == "gitlab" and "merge request" in lower:
+        return True
+    return any(marker in lower for marker in OPEN_MARKERS)
+
+
 def _status_from_text(text: str, platform: str, reviewer_names: list[str]) -> PrStatus:
     if not text:
         return PrStatus(detail="fetch-failed")
     if _looks_like_login_page(text):
         return PrStatus(detail="login-required")
-    return PrStatus(
-        reviewed=_name_matches_review(text, reviewer_names),
-        merged=_is_merged_text(text, platform),
-    )
+
+    reviewed = _name_matches_review(text, reviewer_names)
+    merged = _is_merged_text(text, platform)
+    if reviewed or merged:
+        return PrStatus(reviewed=reviewed, merged=merged)
+
+    if _page_looks_complete(text, platform):
+        return PrStatus()
+
+    return PrStatus(detail="incomplete-page")
 
 
 def check_pr_url(
@@ -200,46 +207,46 @@ def check_pr_url(
     platform: str,
     reviewer_names: list[str],
     *,
-    wait_ms: int = FETCH_WAIT_MS,
+    wait_times: tuple[int, ...] | None = None,
 ) -> PrStatus:
-    text = _fetch_page_text(url, wait_ms=wait_ms)
-    return _status_from_text(text, platform, reviewer_names)
+    waits = wait_times or (FETCH_WAIT_MS, FETCH_RETRY_WAIT_MS)
+    last = PrStatus(detail="fetch-failed")
+    for wait_ms in waits:
+        text = _fetch_page_text(url, wait_ms=wait_ms)
+        status = _status_from_text(text, platform, reviewer_names)
+        last = status
+        if status.reviewed or status.merged or status.detail == "login-required":
+            return status
+        if not status.detail:
+            return status
+    return last
 
 
-def check_pr_tabs(tabs: list[PullRequestRef], reviewer_names: list[str]) -> PrStatus:
+def check_pr_tabs(
+    tabs: list[PullRequestRef],
+    reviewer_names: list[str],
+    *,
+    wait_times: tuple[int, ...] | None = None,
+) -> PrStatus:
     platform = tabs[0].platform
     if any(_is_merged_title(tab.title, platform) for tab in tabs):
         return PrStatus(merged=True)
 
-    best = PrStatus()
+    last = PrStatus(detail="fetch-failed")
     for url in _urls_to_check(tabs):
-        status = check_pr_url(url, platform, reviewer_names)
-        if status.detail and not best.detail:
-            best = PrStatus(detail=status.detail)
-        if status.merged:
-            best = PrStatus(reviewed=best.reviewed or status.reviewed, merged=True)
-            if status.reviewed:
-                return best
-        if status.reviewed:
-            best = PrStatus(reviewed=True, merged=best.merged)
-    return best
+        status = check_pr_url(
+            url,
+            platform,
+            reviewer_names,
+            wait_times=wait_times,
+        )
+        last = status
+        if status.reviewed or status.merged or status.detail == "login-required":
+            return status
+        if not status.detail:
+            return status
+    return last
 
 
-def recheck_pr_tabs(tabs: list[PullRequestRef], reviewer_names: list[str]) -> PrStatus:
-    """Sequential recheck with a longer wait for one best URL."""
-    platform = tabs[0].platform
-    urls = _urls_to_check(tabs)
-    if not urls:
-        return PrStatus()
-    return check_pr_url(
-        urls[0],
-        platform,
-        reviewer_names,
-        wait_ms=FETCH_RETRY_WAIT_MS,
-    )
-
-
-def is_inconclusive(status: PrStatus) -> bool:
-    if status.merged or status.reviewed:
-        return False
-    return status.detail != "login-required"
+def needs_recheck(status: PrStatus) -> bool:
+    return status.detail in ("fetch-failed", "incomplete-page")

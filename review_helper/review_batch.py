@@ -6,7 +6,14 @@ from collections import defaultdict
 
 from review_helper.pr_urls import PullRequestRef
 from review_helper.progress import map_with_progress, status as log_status
-from review_helper.review import PrStatus, check_pr_tabs, is_inconclusive, recheck_pr_tabs
+from review_helper.review import (
+    FETCH_RECHECK_WAIT_MS,
+    PrStatus,
+    check_pr_tabs,
+    needs_recheck,
+)
+
+RECHECK_WAIT_TIMES = (FETCH_RECHECK_WAIT_MS, 20000)
 
 
 def _pr_label(tabs: list[PullRequestRef]) -> str:
@@ -42,20 +49,33 @@ def check_pr_statuses(
         label=lambda item: _pr_label(item[1]),
         parallel=parallel,
     )
-    results = dict(checked)
+    result = dict(checked)
 
-    retry_items = [
+    inconclusive = [
         (key, tabs)
         for key, tabs in items
-        if is_inconclusive(results.get(key, PrStatus()))
+        if needs_recheck(result.get(key, PrStatus()))
     ]
-    if retry_items:
-        log_status(f"Rechecking {len(retry_items)} inconclusive PR(s)...")
-        for key, tabs in retry_items:
-            status = recheck_pr_tabs(tabs, reviewer_names)
-            if status.merged or status.reviewed or (
-                status.detail and status.detail != results.get(key, PrStatus()).detail
-            ):
-                results[key] = status
+    if inconclusive:
+        log_status(f"Rechecking {len(inconclusive)} failed fetch(es)...")
+        def recheck_worker(
+            item: tuple[tuple, list[PullRequestRef]],
+        ) -> tuple[tuple, PrStatus]:
+            key, tabs = item
+            return key, check_pr_tabs(
+                tabs,
+                reviewer_names,
+                wait_times=RECHECK_WAIT_TIMES,
+            )
 
-    return results
+        rechecked = map_with_progress(
+            recheck_worker,
+            inconclusive,
+            desc="Rechecking PR status",
+            unit="pr",
+            label=lambda item: _pr_label(item[1]),
+            parallel=parallel,
+        )
+        result.update(dict(rechecked))
+
+    return result
